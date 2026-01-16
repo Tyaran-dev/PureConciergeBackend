@@ -1,328 +1,167 @@
-import Anthropic from '@anthropic-ai/sdk';
-import { activities, countries, destinations, seasonal_prices, travel_styles } from "../data/index.js"
+import Anthropic from "@anthropic-ai/sdk";
+import { countries, destinations, activities } from "../data/index.js";
 import { ApiError } from "../utils/apiError.js";
 
-// Types
+/* ================= TYPES ================= */
+
 export interface QuizAnswers {
-    interests: string[];
-    personality: string;
-    pace: string;
-    budget_level: string;
-    travel_with: string;
+  interests: string[];
+  personality: string;
+  pace: string;
+  budget_level: "value" | "mid" | "luxury";
+  travel_with: string;
+  days_range: "3-5" | "5-10" | "10-15";
 }
 
-export interface DailyPlan {
-    day: number;
-    morning: string;
-    afternoon: string;
-    evening: string;
+export interface AIPackageDecision {
+  destination: string;
+  country_code: string;
+  trip_duration_days: number;
+  activity_pool: string[];
+  persona_type: string;
 }
 
-export interface EstimatedBudget {
-    accommodation_per_day: number;
-    activities_per_day: number;
-    food_per_day: number;
-    total_per_day: number;
-    total_trip: number;
-    currency: string;
+export interface MultiAIDecisionResponse {
+  packages: AIPackageDecision[];
 }
 
-export interface TravelRecommendation {
-    destination: string;
-    country_code: string;
-    why_this_destination: string;
-    trip_duration_days: number;
-    daily_plan: DailyPlan[];
-    estimated_budget: EstimatedBudget;
-    travel_persona_match: string;
+/* ================= CLIENT ================= */
+
+const anthropic = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY!,
+});
+
+/* ================= HELPERS ================= */
+
+function parseDaysRange(range: string) {
+  const [min, max] = range.split("-").map(Number);
+  return { min, max };
 }
 
-// Static Data Interfaces
-interface Country {
-    code: string;
-    name: string;
-    region: string;
-    best_for: string[];
-    travel_pace: string;
-    visa_required: boolean;
-}
+/* ================= FILTER DATA ================= */
+function filterRelevantData(quiz: QuizAnswers, lang: "en" | "ar") {
+  const matchingCountries = countries
+    .filter(c => c.best_for.some(i => quiz.interests.includes(i)))
+    .slice(0, 6)
+    .map(c => ({
+      code: c.code,
+      name: lang === "ar" ? c.name_ar : c.name,
+      best_for: lang === "ar" ? c.best_for_ar : c.best_for,
+    }));
 
-interface Activity {
-    id: string;
-    type: string;
-    energy: string;
-    duration_hours: number;
-    country?: string;
-}
+  const countryCodes = matchingCountries.map(c => c.code);
 
-interface Destination {
-    country: string;
-    city: string;
-    best_for: string[];
-    recommended_days: number;
-}
+  const relevantDestinations = destinations
+    .filter(d => countryCodes.includes(d.country))
+    .map(d => ({
+      country: d.country,
+      city_ar: lang === "ar" ? d.city_ar : d.city,
+      city: d.city,
+      lat: d.lat,
+      lng: d.lng,
+      image: d.image,
+    }));
 
-interface SeasonalPrices {
-    [countryCode: string]: {
-        low: number;
-        mid: number;
-        high: number;
-    };
-}
+  const relevantActivities = activities
+    .filter(a => quiz.interests.some(i => a.type.includes(i)))
+    .slice(0, 10)
+    .map(a => ({
+      id: a.id,
+      label: lang === "ar" ? a.label_ar : a.label_en,
+    }));
 
-interface TravelStyles {
-    [key: string]: {
-        description: string;
-        activity_ratio: number;
-        relax_ratio: number;
-    };
-}
-
-
-/**
- * SMART FILTERING: Reduce data before sending to Claude
- * This dramatically reduces token usage for large datasets
- */
-function filterRelevantData(
-    quizAnswers: QuizAnswers,
-    countries: Country[],
-    seasonal_prices: SeasonalPrices,
-    activities: Activity[],
-    destinations: Destination[],
-) {
-
-    console.log(countries, "countries before filtertion")
-    // 1. Filter countries based on user interests
-    const matchingCountries = countries.filter(country => {
-        // Check if country's best_for matches any user interests
-        const hasMatchingInterest = country.best_for.some(interest =>
-            quizAnswers.interests.includes(interest)
-        );
-
-        // Match personality (relaxing → relax destinations)
-        const matchesPersonality =
-            (quizAnswers.personality === 'relaxing' && country.best_for.includes('relax')) ||
-            (quizAnswers.personality === 'adventurous' && country.best_for.includes('explorer')) ||
-            (quizAnswers.personality === 'cultural' && country.best_for.includes('culture'));
-
-        return hasMatchingInterest || matchesPersonality;
-    });
-
-    // If no exact matches, take top 3-5 countries to give Claude options
-    const relevantCountries = matchingCountries.length > 0
-        ? matchingCountries.slice(0, 5)
-        : countries.slice(0, 5);
-
-    // 2. Get country codes for filtering
-    const relevantCountryCodes = relevantCountries.map(c => c.code);
-
-    // 3. Filter destinations to only relevant countries
-    const relevantDestinations = destinations.filter(dest =>
-        relevantCountryCodes.includes(dest.country)
-    );
-
-    // 4. Filter seasonal prices to only relevant countries
-    const relevantPrices: SeasonalPrices = {};
-    relevantCountryCodes.forEach(code => {
-        if (seasonal_prices[code]) {
-            relevantPrices[code] = seasonal_prices[code];
-        }
-    });
-
-    // 5. Filter activities based on user interests and relevant countries
-    const relevantActivities = activities.filter(activity => {
-        // Match activity type with user interests
-        const matchesInterest = quizAnswers.interests.some(interest =>
-            activity.type.toLowerCase().includes(interest.toLowerCase()) ||
-            interest.toLowerCase().includes(activity.type.toLowerCase())
-        );
-
-        // If activity has country, only include if country is relevant
-        const matchesCountry = !activity.country || relevantCountryCodes.includes(activity.country);
-
-        // Match energy level with pace
-        const matchesPace =
-            (quizAnswers.pace === 'balanced') ||
-            (quizAnswers.pace === 'slow' && activity.energy === 'low') ||
-            (quizAnswers.pace === 'fast' && activity.energy === 'high');
-
-        return (matchesInterest || matchesPace) && matchesCountry;
-    });
-
-    // Take max 20 activities to prevent huge prompts
-    const limitedActivities = relevantActivities.slice(0, 20);
-
-    return {
-        countries: relevantCountries,
-        destinations: relevantDestinations,
-        prices: relevantPrices,
-        activities: limitedActivities,
-    };
+  return {
+    countries: matchingCountries,
+    destinations: relevantDestinations,
+    activities: relevantActivities,
+  };
 }
 
 
-// Initialize Anthropic client
-// const anthropic = new Anthropic({
-//     apiKey: process.env.ANTHROPIC_API_KEY
-// });
+/* ================= PROMPT ================= */
 
-/**
- * Build optimized prompt with filtered data
- */
 function buildPrompt(
-    quizAnswers: QuizAnswers,
-    filteredData: ReturnType<typeof filterRelevantData>,
-    travelStyles: TravelStyles
+  quiz: QuizAnswers,
+  filteredData: ReturnType<typeof filterRelevantData>
 ): string {
-    console.log(filteredData.countries, "countries from prompt builder after filtertion")
-    return `You are an AI Travel Architect and behavioral travel expert.
-You MUST only use the provided destinations and prices.
-Do not invent cities, prices, or activities.
+  const { min, max } = parseDaysRange(quiz.days_range);
 
-USER PROFILE (from quiz):
-${JSON.stringify(quizAnswers, null, 2)}
+  return `
+Generate exactly 4 travel package decisions.
 
-AVAILABLE DATA (pre-filtered for this user):
+IMPORTANT: Respond in Arabic. All text fields (why_this_destination,   travel_persona_match) must be in Arabic
 
-Countries (${filteredData.countries.length} matches):
-${JSON.stringify(filteredData.countries, null, 2)}
+USER:
+${JSON.stringify(quiz)}
 
-Seasonal Prices:
-${JSON.stringify(filteredData.prices, null, 2)}
+DATA:
+${JSON.stringify(filteredData)}
 
-Travel Styles:
-${JSON.stringify(travelStyles, null, 2)}
+RULES:
+- Each package must use a DIFFERENT destination
+- trip_duration_days MUST be between ${min} and ${max}
+- Choose 4–6 activity IDs only
+- NO daily plans
+- Daily plans: vary activities (no repeats in same time slots)
+- NO prices
+- NO explanations
 
-Activities (${filteredData.activities.length} relevant):
-${JSON.stringify(filteredData.activities, null, 2)}
+DAILY PLAN CONSTRAINTS (VERY IMPORTANT):
+- Each day MUST be different from the others
+- Do NOT repeat the same activity sequence across days
+- Do NOT place the same activity in the same time slot on consecutive days
+- If activities are limited, rotate them intelligently
+- Prefer variety over repetition
 
-Destinations:
-${JSON.stringify(filteredData.destinations, null, 2)}
+PACKAGE TYPES (use each once):
+1. Best Match
+2. Budget
+3. Luxury
+4. Alternative Country
+5. Extended Stay
 
-INSTRUCTIONS:
-1. Analyze the user's profile and match them to the BEST destination from the available countries
-2. Select ONLY cities from the destinations array that match their country
-3. Use ONLY activities from the provided activities list
-4. Calculate budget using the seasonal_prices for the selected country
-5. Create a realistic daily plan with activities from the activities list
-6. Match the trip duration to the recommended_days from destinations
-7. Consider their budget_level: "value" means use "low" or "mid" season prices, "luxury" means "high"
-8. Consider their pace: "balanced" means mix of activities and rest
-9. Consider their travel_with: "partner" means romantic, couple-friendly activities
-
-You MUST respond with ONLY a valid JSON object (no markdown, no backticks, no explanations) matching this exact schema:
-
+FORMAT (JSON ONLY):
 {
-  "destination": "Country Name, City Name",
-  "country_code": "XX",
-  "why_this_destination": "2-3 sentence explanation of why this matches their profile",
-  "trip_duration_days": 0,
-  "daily_plan": [
+  "packages": [
     {
-      "day": 1,
-      "morning": "activity from activities list",
-      "afternoon": "activity from activities list",
-      "evening": "activity from activities list"
+      "destination": "Country, City",
+      "country_code": "XX",
+      "city": "city (not city_ar)"
+      "why_this_destination": "1-2 sentences",
+      "trip_duration_days": 0,
+      "activity_pool": ["id","id"],
+      "persona_type": "Best Match",
+      "travel_persona_match": "Type + reason"
     }
-  ],
-  "estimated_budget": {
-    "accommodation_per_day": 0,
-    "activities_per_day": 0,
-    "food_per_day": 0,
-    "total_per_day": 0,
-    "total_trip": 0,
-    "currency": "USD"
-  },
-  "travel_persona_match": "Explorer/Relaxer/Luxury with explanation"
+  ]
 }`;
 }
 
+/* ================= MAIN ================= */
 
-// Main function to generate recommendation
-export async function generateRecommendation(
-    quizAnswers: QuizAnswers
-): Promise<TravelRecommendation> {
-    try {
+export async function generateAIDecisions(
+  quiz: QuizAnswers,
+  lang: "en" | "ar" = "ar"
+): Promise<MultiAIDecisionResponse> {
+  try {
+    const filteredData = filterRelevantData(quiz, lang);
+    const prompt = buildPrompt(quiz, filteredData);
 
-        const filteredData = filterRelevantData(
-            quizAnswers,
-            countries,
-            seasonal_prices,
-            activities,
-            destinations,
-        );
+    const msg = await anthropic.messages.create({
+      model: "claude-sonnet-4-5-20250929",
+      max_tokens: 1500,
+      temperature: 0.6,
+      system: "Return valid JSON only.",
+      messages: [{ role: "user", content: prompt }],
+    });
 
-        // Build the prompt
-        const prompt = buildPrompt(
-            quizAnswers,
-            filteredData,
-            travel_styles,
-        );
+    const text = msg.content[0].text
+      .replace(/```json|```/g, "")
+      .trim();
 
-        // Call Claude API
-        const message = await anthropic.messages.create({
-            model: 'claude-sonnet-4-5-20250929',
-            max_tokens: 4096,
-            temperature: 0.7,
-            system: `
-                        You are an AI Travel Architect.
-                        You MUST follow the schema exactly.
-                        Return JSON only.
-                        Do not add explanations.
-                    `,
-            messages: [
-                {
-                    role: 'user',
-                    content: prompt,
-                },
-            ],
-        });
-
-        // Extract and parse the response
-        const responseText = message.content[0].text.trim();
-
-        // Remove markdown code blocks if present
-        let cleanedResponse = responseText;
-        if (responseText.startsWith('```')) {
-            cleanedResponse = responseText
-                .replace(/```json\n?/g, '')
-                .replace(/```\n?/g, '')
-                .trim();
-        }
-
-        // Parse the JSON response
-        const recommendation: TravelRecommendation = JSON.parse(cleanedResponse);
-
-        return recommendation;
-    } catch (error) {
-        console.error('Error generating recommendation:', error);
-
-        // JSON parsing error (Claude returned invalid JSON)
-        if (error instanceof SyntaxError) {
-            throw new ApiError(
-                502,
-                `Failed to parse AI response (invalid JSON): ${error.message}`
-            );
-        }
-
-        // Claude / Anthropic API error
-        if (error instanceof Anthropic.APIError) {
-            throw new ApiError(
-                error.status || 502,
-                `Claude API error: ${error.message}`
-            );
-        }
-
-        // Known ApiError → rethrow as-is
-        if (error instanceof ApiError) {
-            throw error;
-        }
-
-        // Fallback (unknown error)
-        throw new ApiError(
-            500,
-            'Failed to generate travel recommendation'
-        );
-    }
-};
-
+    return JSON.parse(text);
+  } catch (err) {
+    console.error(err);
+    throw new ApiError(502, "Claude decision generation failed");
+  }
+}

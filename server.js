@@ -1,12 +1,11 @@
+import "dotenv/config";
 import express from "express";
-import dotenv from "dotenv";
 import cors from "cors";
 import bodyParser from "body-parser";
 import { ApiError } from "./utils/apiError.js";
 import packagesRoute from "./routes/pacakges/packges.route.js"
 
 const app = express();
-dotenv.config();
 const allowedOrigins = [
     'http://localhost:4025',  // development
     'https://tayyran.com'     // production
