@@ -8,7 +8,7 @@ import packagesRoute from "./routes/pacakges/packges.route.js"
 const app = express();
 const allowedOrigins = [
     'http://localhost:4025',  // development
-    'https://tayyran.com'     // production
+    'https://pureconcierges.com'     // production
 ];
 
 
